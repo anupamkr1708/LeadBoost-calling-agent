@@ -152,8 +152,11 @@ class CallAttempt(Base):
     __table_args__ = (
         Index("ix_attempts_lead_scheduled", "lead_id", "scheduled_at"),
         Index("ix_attempts_org_id", "organization_id"),
-        # Partial index WHERE status = 'pending' (TRD Part 4.2) is created
-        # as raw SQL in the alembic migration — see decision #4.
+        Index("ix_attempts_call_id", "call_id"),
+        # Partial index WHERE status = 'pending' (TRD Part 4.2), and the
+        # Phase 1 "at most one RUNNING attempt per call" partial unique
+        # index, are both created as raw SQL in the alembic migration —
+        # see decision #4.
     )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -163,6 +166,89 @@ class CallAttempt(Base):
     status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     call_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)  # soft ref
+    # --- Phase 1 additions (docs/PHASE1_DESIGN.md "Domain model") ---
+    session_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_category: Mapped[str | None] = mapped_column(String, nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ConversationSession(Base):
+    """The live execution session — distinct from the logical `Call` and
+    from a `CallAttempt` (docs/PHASE1_DESIGN.md "Domain model"): a
+    `CallAttempt` is "we tried to run this"; a session is "the actual
+    runtime execution that attempt spawned". One attempt has at most one
+    session (a crashed attempt's session ends ABORTED; a retry gets a new
+    attempt AND a new session, never a reused one)."""
+
+    __tablename__ = "conversation_sessions"
+    __table_args__ = (
+        Index("ix_sessions_org_id", "organization_id"),
+        Index("ix_sessions_attempt_id", "call_attempt_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    call_attempt_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)  # soft ref
+    worker_id: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, default="started", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CallAttemptEvent(Base):
+    """Ordered, durable record of what happened during an attempt —
+    "enough to reconstruct who/what/when/why it ended" without full event
+    sourcing (nothing replays state from this table; it's read by
+    observability and by retry/audit review). `sequence_number` is the
+    real ordering key, not `occurred_at` — two events can share a
+    timestamp (docs/PHASE1_DESIGN.md "Domain model")."""
+
+    __tablename__ = "call_attempt_events"
+    __table_args__ = (
+        UniqueConstraint("call_attempt_id", "sequence_number", name="uq_attempt_event_sequence"),
+        Index("ix_attempt_events_org_id", "organization_id"),
+        Index("ix_attempt_events_attempt_id", "call_attempt_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    call_attempt_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)  # soft ref
+    sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CallIdempotencyKey(Base):
+    """The REAL enforcement point for `POST /v1/calls` idempotency — see
+    docs/PHASE1_DESIGN.md "Idempotency" for why this can't just be a unique
+    constraint on `calls.idempotency_key` (that table is partitioned by
+    `created_at`) and why it can't just be a Redis SETNX (Redis is
+    ephemeral/coordination, not durable business truth, by this system's
+    own stated design principle). Deliberately NOT partitioned — this
+    table's whole reason to exist is carrying one real, DB-enforced unique
+    constraint."""
+
+    __tablename__ = "call_idempotency_keys"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["call_id", "call_created_at"],
+            ["calls.id", "calls.created_at"],
+            name="fk_idempotency_call",
+        ),
+    )
+
+    organization_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
+    call_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    call_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AgentConfig(Base):

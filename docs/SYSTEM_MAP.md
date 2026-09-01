@@ -1,5 +1,12 @@
 # System Map — Phase 0
 
+> **This document reflects Phase 0's state at the time it was written.**
+> It has since been audited (`docs/PHASE0_AUDIT.md` — two real bugs found
+> and fixed, including one directly affecting the "DB session factory +
+> RLS-scoped session" row below) and superseded for current status by
+> `docs/PHASE1_DESIGN.md` and `docs/PHASE1_IMPLEMENTATION_REPORT.md`. Kept
+> here unedited as an accurate historical record, not updated in place.
+
 Legend (matches the reference repo's convention, per the master prompt):
 ✅ wired-and-invoked · 🔵 fake-verified · 🟡 code-ready-untested · 🔴 not built
 

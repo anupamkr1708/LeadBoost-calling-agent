@@ -108,6 +108,30 @@ def test_entrypoint_modules_are_never_imported() -> None:
     assert not violations, "Entrypoint import violations found:\n" + "\n".join(violations)
 
 
+def test_internal_dependency_bans() -> None:
+    """Phase 1's internal layering rules (docs/PHASE1_DESIGN.md): dependency
+    direction is orchestrator -> conversation -> telephony, never the
+    reverse, and orchestrator/ stays framework-agnostic (no fastapi
+    import). See app.layers.LAYER_GRAPH.dependency_bans."""
+    modules_and_imports = _all_modules_and_imports()
+    violations: list[str] = []
+
+    for module_name, imports in modules_and_imports.items():
+        for rule in LAYER_GRAPH.dependency_bans:
+            is_forbidden_importer = any(
+                module_name == prefix or module_name.startswith(prefix + ".")
+                for prefix in rule.forbidden_importer_prefixes
+            )
+            if not is_forbidden_importer:
+                continue
+            for imported in imports:
+                for banned in rule.banned_import_prefixes:
+                    if imported == banned or imported.startswith(banned + "."):
+                        violations.append(f"{module_name} imports '{imported}'. {rule.reason}")
+
+    assert not violations, "Dependency ban violations found:\n" + "\n".join(violations)
+
+
 def test_layering_check_actually_scans_a_nonzero_number_of_files() -> None:
     """Guards against this test silently passing because glob found nothing
     (e.g. a bad REPO_ROOT) — an empty scan must not read as 'all clear'."""

@@ -20,7 +20,7 @@ def _isolate_env(monkeypatch):
     # silently read that stale cached value instead of what it just set.
     for key in list(os.environ):
         if key in {
-            "ENVIRONMENT", "DATABASE_URL", "REDIS_URL", "JWT_PRIVATE_KEY",
+            "ENVIRONMENT", "DATABASE_URL", "DATABASE_MIGRATION_URL", "REDIS_URL", "JWT_PRIVATE_KEY",
             "JWT_PUBLIC_KEY", "WEBHOOK_HMAC_SECRET", "EXOTEL_API_KEY",
             "DEEPGRAM_API_KEY", "GROQ_API_KEY", "REQUIRE_TLS_DB", "REQUIRE_TLS_REDIS",
         }:
@@ -120,6 +120,30 @@ def test_refuses_to_boot_in_production_with_tls_disabled(monkeypatch, tmp_path):
 
     with pytest.raises(ConfigError):
         get_settings()
+
+
+def test_database_migration_url_defaults_to_none_and_database_url_stands_alone(monkeypatch, tmp_path):
+    """When DATABASE_MIGRATION_URL isn't set, Settings must not invent one —
+    callers (alembic/env.py, storage/db.py) are responsible for falling back
+    to database_url themselves. See docs/PHASE0_AUDIT.md Finding 1."""
+    _set_minimal_valid_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    from app.config import get_settings
+
+    settings = get_settings()
+    assert settings.database_migration_url is None
+    assert settings.masked_summary()["database_migration_url_set"] is False
+
+
+def test_database_migration_url_can_be_set_independently(monkeypatch, tmp_path):
+    _set_minimal_valid_env(monkeypatch, DATABASE_MIGRATION_URL="postgresql://admin:p@localhost/db")
+    monkeypatch.chdir(tmp_path)
+    from app.config import get_settings
+
+    settings = get_settings()
+    assert settings.database_migration_url is not None
+    assert settings.database_migration_url.get_secret_value() == "postgresql://admin:p@localhost/db"
+    assert settings.masked_summary()["database_migration_url_set"] is True
 
 
 def test_rejects_unknown_environment_value(monkeypatch, tmp_path):

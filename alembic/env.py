@@ -22,7 +22,16 @@ if config.config_file_name is not None:
 
 # Database URL comes from the fail-closed Settings loader, never from
 # alembic.ini directly — one source of truth for secrets (TRD Part 5.4).
-config.set_main_option("sqlalchemy.url", get_settings().database_url.get_secret_value())
+# Migrations run DDL and must own the tables, so they use the separate,
+# more-privileged `database_migration_url` when one is configured (falling
+# back to `database_url` for single-role local/CI setups) — never the
+# RLS-restricted app role, which lacks the grants to CREATE TABLE / ALTER
+# TABLE ... FORCE ROW LEVEL SECURITY. See app/config.py and
+# docs/PHASE0_AUDIT.md Finding 1 for why these are deliberately two
+# different settings.
+_settings = get_settings()
+_migration_url = _settings.database_migration_url or _settings.database_url
+config.set_main_option("sqlalchemy.url", _migration_url.get_secret_value())
 
 # add your model's MetaData object here
 # for 'autogenerate' support

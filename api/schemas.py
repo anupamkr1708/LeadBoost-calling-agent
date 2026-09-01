@@ -12,9 +12,11 @@ class CreateCallRequest(BaseModel):
     campaign_id: uuid.UUID | None = None
     idempotency_key: str | None = Field(
         default=None,
-        description="Client-supplied idempotency key. Real dedup enforcement "
-        "is a Redis SETNX check added in Phase 1 when calls are actually "
-        "dispatched — Phase 0 only records it (TRD Part 3.5).",
+        description="Client-supplied idempotency key. Enforced via a real "
+        "database-unique constraint (call_idempotency_keys, Phase 1) — not "
+        "a Redis SETNX, since Redis alone wouldn't survive an eviction or "
+        "restart and this system treats Postgres as durable business truth "
+        "(see docs/PHASE1_DESIGN.md \"Idempotency\").",
     )
 
 

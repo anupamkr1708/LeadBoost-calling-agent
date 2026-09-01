@@ -74,7 +74,34 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
     # --- secrets: NO DEFAULTS. Missing => pydantic raises at construction. ---
+    # `database_url` is the role the RUNNING SERVICE connects as for all
+    # request-serving traffic. In staging/production this MUST be the
+    # RLS-restricted `calling_agent_app` role (see the baseline migration) —
+    # storage.db fails closed at connect time if it isn't (Phase 0 audit
+    # Finding 1: a superuser/BYPASSRLS role makes FORCE ROW LEVEL SECURITY a
+    # no-op, silently disabling the tenant-isolation backstop this schema
+    # was built for). `database_migration_url` is an OPTIONAL, separate,
+    # more-privileged DSN used only by Alembic to run DDL; when unset, both
+    # fall back to `database_url`, which keeps a single-role local/CI setup
+    # working unchanged.
     database_url: SecretStr
+    database_migration_url: SecretStr | None = Field(default=None)
+    # A THIRD, narrowly-scoped role for cross-organization SYSTEM reads —
+    # the worker runtime's reaper/reconciliation sweeps and its "look up
+    # what org this claimed attempt_id belongs to" step (docs/PHASE1_DESIGN.md
+    # "Concurrency / worker acquisition") genuinely need to find a row
+    # before they know which org to scope a request to, which
+    # `database_url`'s RLS-restricted role cannot do by design. This is
+    # NOT a broader version of database_url — it is SELECT-only, on
+    # exactly the two tables that need it (call_attempts,
+    # conversation_sessions), never used for writes (those always go
+    # through org_scoped_session once the org is known). Falls back to
+    # `database_url` when unset, which is fine in dev/test where a single
+    # shared role already sees everything; staging/production must set
+    # this to the dedicated `calling_agent_worker` role from the
+    # migration, never to database_migration_url's role (that one CAN
+    # write/DDL — this one deliberately cannot).
+    database_worker_url: SecretStr | None = Field(default=None)
     redis_url: SecretStr
     jwt_private_key: SecretStr
     jwt_public_key: SecretStr
@@ -92,6 +119,38 @@ class Settings(BaseSettings):
     # --- TLS enforcement (TRD Part 5.2) ---
     require_tls_db: bool = Field(default=True)
     require_tls_redis: bool = Field(default=True)
+
+    # --- Phase 1 runtime policy (docs/PHASE1_DESIGN.md) ---
+    # Global bound on concurrently-RUNNING call attempts in this process.
+    # Per-org bound comes from organizations.plan_max_concurrent_calls
+    # (data, not config) and is enforced separately at claim time.
+    max_concurrent_calls: int = Field(default=5, gt=0)
+    # How often an idle worker slot re-checks the ready queue, and how
+    # often the reaper sweeps for expired leases / the reconciliation
+    # sweep looks for un-enqueued PENDING attempts. Redis's sorted sets
+    # have no blocking "wait for score <= now" primitive, so this is
+    # disciplined polling, not a magic sleep() (see PHASE1_DESIGN.md
+    # "Queue (Redis)").
+    queue_poll_interval_seconds: float = Field(default=0.5, gt=0)
+    # How many candidate attempts one claim call pulls from the ready set
+    # at a time.
+    queue_claim_batch_size: int = Field(default=1, gt=0)
+    # Visibility timeout: how long a worker has to finish (or the reaper
+    # reclaims the attempt).
+    queue_lease_seconds: float = Field(default=45.0, gt=0)
+    retry_max_attempts: int = Field(default=3, gt=0)
+    retry_initial_delay_seconds: float = Field(default=5.0, gt=0)
+    retry_backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    retry_max_delay_seconds: float = Field(default=120.0, gt=0)
+    # Bounded jitter fraction applied to each computed backoff delay, to
+    # avoid a thundering herd of simultaneously-retrying attempts.
+    retry_jitter_fraction: float = Field(default=0.2, ge=0, le=1.0)
+    # Every provider operation (place_call) gets this much wall-clock time
+    # before the runtime treats it as a TIMEOUT failure.
+    provider_operation_timeout_seconds: float = Field(default=30.0, gt=0)
+    # On shutdown, how long in-flight attempts get to finish before their
+    # asyncio task is cancelled outright (see PHASE1_DESIGN.md "Shutdown").
+    shutdown_grace_period_seconds: float = Field(default=20.0, gt=0)
 
     @field_validator("environment")
     @classmethod
@@ -149,6 +208,8 @@ class Settings(BaseSettings):
             "require_tls_db": self.require_tls_db,
             "require_tls_redis": self.require_tls_redis,
             "database_url_set": bool(self.database_url.get_secret_value()),
+            "database_migration_url_set": self.database_migration_url is not None,
+            "database_worker_url_set": self.database_worker_url is not None,
             "redis_url_set": bool(self.redis_url.get_secret_value()),
         }
 

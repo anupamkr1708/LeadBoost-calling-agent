@@ -67,11 +67,22 @@ jobs:
 
       - name: Write CI .env.test
         run: |
+          # DATABASE_URL is the role the APP actually connects as for
+          # request traffic — calling_agent_app, the RLS-restricted role,
+          # NOT the ephemeral Postgres container's bootstrap superuser
+          # (calling_agent). DATABASE_MIGRATION_URL is the superuser role,
+          # used only by the Alembic step below. Getting this backwards is
+          # exactly Phase 0 audit Finding 1 — the app's own connection
+          # silently bypassing the RLS it was built to enforce — so CI now
+          # exercises the same role split the app fails closed on at
+          # runtime (storage/db.py).
           cat > .env.test <<'EOF'
           ENVIRONMENT=test
           SERVICE_NAME=calling-agent
           LOG_LEVEL=DEBUG
-          DATABASE_URL=postgresql+psycopg://calling_agent:ci_only_pw@localhost:5432/calling_agent_test
+          DATABASE_URL=postgresql+psycopg://calling_agent_app:app_role_test_pw@localhost:5432/calling_agent_test
+          DATABASE_MIGRATION_URL=postgresql+psycopg://calling_agent:ci_only_pw@localhost:5432/calling_agent_test
+          DATABASE_WORKER_URL=postgresql+psycopg://calling_agent_worker:worker_role_test_pw@localhost:5432/calling_agent_test
           REDIS_URL=redis://localhost:6379/1
           REQUIRE_TLS_DB=false
           REQUIRE_TLS_REDIS=false
@@ -96,31 +107,52 @@ jobs:
               f.write(f'JWT_PUBLIC_KEY="{pub}"\n')
               f.write(f'WEBHOOK_HMAC_SECRET={secrets.token_urlsafe(32)}\n')
           PY
+          # Settings loads from a fixed ".env" filename (see app/config.py);
+          # .env.test is a test-suite-only convention that tests/conftest.py
+          # loads by hand before importing app code. Standalone CLI
+          # invocations below (alembic) have no such workaround, so without
+          # this copy `alembic upgrade head` fails closed with 5 missing
+          # required fields — this was Phase 0 audit Finding 2, reproduced
+          # and fixed here.
+          cp .env.test .env
 
-      - name: Run baseline Alembic migration against ephemeral Postgres
+      - name: Run Alembic migrations against ephemeral Postgres
         run: alembic upgrade head
 
-      - name: Create app-role password + grants for CI
+      - name: Create app-role + worker-role passwords and grants for CI
         env:
           PGPASSWORD: ci_only_pw
         run: |
+          # Both calling_agent_app and calling_agent_worker are CREATEd
+          # (idempotently) by the migrations above, so this step must run
+          # AFTER them, not before — an earlier version of this workflow
+          # had this backwards, which would fail on a genuinely fresh
+          # database (ALTER ROLE on a role that doesn't exist yet).
           psql -h localhost -U calling_agent -d calling_agent_test -c "ALTER ROLE calling_agent_app WITH PASSWORD 'app_role_test_pw'; ALTER ROLE calling_agent_app WITH LOGIN;"
           psql -h localhost -U calling_agent -d calling_agent_test -c "GRANT CONNECT ON DATABASE calling_agent_test TO calling_agent_app; GRANT USAGE ON SCHEMA public TO calling_agent_app;"
+          psql -h localhost -U calling_agent -d calling_agent_test -c "ALTER ROLE calling_agent_worker WITH PASSWORD 'worker_role_test_pw'; ALTER ROLE calling_agent_worker WITH LOGIN;"
+          psql -h localhost -U calling_agent -d calling_agent_test -c "GRANT CONNECT ON DATABASE calling_agent_test TO calling_agent_worker; GRANT USAGE ON SCHEMA public TO calling_agent_worker;"
 
       # --- 4. Unit + integration test suite ---
       - name: Unit tests
         run: pytest tests/unit -v
 
-      # (No standalone tests/integration/ suite exists yet in Phase 0 — no
-      # component has been built that needs one beyond what layering/
-      # multitenant/contract already cover; this step is a placeholder that
-      # will start asserting real coverage once Phase 1 adds the orchestrator.)
-      - name: Integration tests (placeholder, Phase 1+)
+      # Phase 1 added a real tests/integration/ suite (real Postgres + real
+      # Redis + the fake provider): queue primitives, idempotent admission
+      # under real concurrency, the required end-to-end path + failure
+      # variants, the capacity/concurrency test, tenant isolation through
+      # the runtime, and the RLS-bypass-guard regression. The conditional
+      # below is kept (rather than a bare `pytest tests/integration -v`)
+      # so this step fails loudly with a clear message if the directory
+      # ever goes empty again, instead of pytest's own "no tests collected"
+      # exit code doing that silently.
+      - name: Integration tests
         run: |
           if [ -n "$(find tests/integration -name 'test_*.py')" ]; then
             pytest tests/integration -v
           else
-            echo "No integration tests yet (Phase 0 has none to run) — not a skip of an existing suite, there is genuinely nothing here yet."
+            echo "tests/integration exists but has no test_*.py files — that's unexpected as of Phase 1, failing loudly rather than silently passing an empty step." >&2
+            exit 1
           fi
 
       # --- 5. API/contract test suite ---
@@ -132,11 +164,16 @@ jobs:
         run: pytest tests/multitenant -v
 
       # --- 7. Regression: eval harness + capacity benchmark ---
-      # No LLM-driven layer exists yet (Phase 3+), so there is no eval
-      # harness to run and no capacity benchmark to diff. This step is
-      # intentionally a no-op with an explicit reason, not a silent skip.
+      # No LLM-driven layer exists yet (Phase 2+), so there is still no
+      # eval harness to run. Phase 1 DOES have a capacity benchmark
+      # (scripts/benchmark.py) — it's run manually, not on every CI push
+      # (each level takes real wall-clock seconds against real Postgres/
+      # Redis, and CI runners' CPU allocation makes absolute numbers noisy
+      # and not worth gating merges on); its most recent real results are
+      # in docs/PHASE1_IMPLEMENTATION_REPORT.md §14, produced by actually
+      # running it, not estimated.
       - name: Regression suite (eval harness + capacity benchmark)
-        run: echo "No eval harness or capacity benchmark exists yet — Phase 0 has no LLM-driven layer or dispatch path to benchmark."
+        run: echo "No eval harness yet (Phase 2+, no LLM layer). Capacity benchmark exists (scripts/benchmark.py) but runs manually — see docs/PHASE1_IMPLEMENTATION_REPORT.md §14 for its most recent real results."
 
       # --- 8. Secrets scan + dependency vulnerability scan ---
       - name: Secrets scan (against reviewed baseline)
