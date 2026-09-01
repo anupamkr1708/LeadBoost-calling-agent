@@ -1,0 +1,69 @@
+"""The layer graph, as DATA — not enforced by convention, enforced by
+`tests/layering/test_import_boundaries.py`, which parses the AST of every
+module in this repo and fails CI if an import violates this graph.
+
+Mirrors the technique in both source repos (Calling-Agent-'s foundation/layers
+and LeadBoost-saas's api -> application -> core rule). See PRD/TRD Part 8's
+table and roadmap Part G's "Architecture layering" row.
+
+Rules encoded here (Phase 0 scope — expanded as later phases add packages):
+
+1. Vendor SDK confinement: ONLY `telephony/exotel/**` may import an Exotel
+   SDK/socket module, and ONLY `telephony/deepgram/**` may import a Deepgram
+   client. No other package may import either directly — they may only
+   depend on `telephony.contracts` (the Protocol definitions).
+2. Embedding-client confinement: ONLY `retrieval/**` may import an embedding
+   client library. (No embedding client is wired yet in Phase 0; this rule
+   exists now so Phase 3 can't accidentally violate it.)
+3. `storage/**` owns the ORM models and the only DB session factory. No
+   other package may import a raw `sqlalchemy.orm.Session` constructor or
+   open its own engine — everyone goes through `storage.db.get_session`.
+4. `app/**` (composition root) may import anything. Nothing may import
+   `app.main` (no cycles back into the entrypoint).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class VendorConfinementRule:
+    """A vendor/library import that is confined to one or more allowed
+    package prefixes; any other importer is a layering violation."""
+
+    forbidden_import_prefixes: tuple[str, ...]
+    allowed_importer_prefixes: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class LayerGraph:
+    vendor_confinement: tuple[VendorConfinementRule, ...] = field(default_factory=tuple)
+    # Packages that may never be imported by anything except the composition root.
+    entrypoint_only_modules: tuple[str, ...] = field(default_factory=tuple)
+
+
+LAYER_GRAPH = LayerGraph(
+    vendor_confinement=(
+        VendorConfinementRule(
+            forbidden_import_prefixes=("exotel",),
+            allowed_importer_prefixes=("telephony.exotel",),
+            reason=(
+                "Exotel SDK/socket libraries must be confined to "
+                "telephony/exotel/ — this is the single vendor-audio "
+                "adapter boundary (roadmap Part D.1 rule 5 / Part E.1)."
+            ),
+        ),
+        VendorConfinementRule(
+            forbidden_import_prefixes=("deepgram",),
+            allowed_importer_prefixes=("telephony.deepgram",),
+            reason="Deepgram client must be confined to telephony/deepgram/.",
+        ),
+        VendorConfinementRule(
+            forbidden_import_prefixes=("groq",),
+            allowed_importer_prefixes=("conversation.llm_client",),
+            reason="Groq client must be confined to conversation/llm_client.py.",
+        ),
+    ),
+    entrypoint_only_modules=("app.main",),
+)

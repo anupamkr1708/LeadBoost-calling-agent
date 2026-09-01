@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+exclude = [".venv", "alembic/versions", ".secrets_local"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # line length handled loosely; content clarity > strict wrap
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # tightened phase-by-phase; Phase 0 baseline
+ignore_missing_imports = true
+exclude = ["alembic/versions", ".venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
