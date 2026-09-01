@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: calling_agent
+          POSTGRES_PASSWORD: ci_only_pw
+          POSTGRES_DB: calling_agent_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U calling_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --- 1. Lint + format check ---
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      # --- 2. Type check (strict mode) ---
+      - name: Type check (mypy --strict on core packages)
+        run: mypy --strict app api storage
+
+      - name: Type check (mypy, whole repo incl. tests)
+        run: mypy . --exclude 'alembic/versions' --exclude '.venv'
+
+      # --- 3. AST-based layering/import-boundary check ---
+      - name: Layering check
+        run: pytest tests/layering -v
+
+      # --- setup real ephemeral Postgres/Redis extensions + role/RLS baseline ---
+      - name: Create pgvector/pgcrypto extensions
+        env:
+          PGPASSWORD: ci_only_pw
+        run: |
+          psql -h localhost -U calling_agent -d calling_agent_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h localhost -U calling_agent -d calling_agent_test -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+      - name: Write CI .env.test
+        run: |
+          cat > .env.test <<'EOF'
+          ENVIRONMENT=test
+          SERVICE_NAME=calling-agent
+          LOG_LEVEL=DEBUG
+          DATABASE_URL=postgresql+psycopg://calling_agent:ci_only_pw@localhost:5432/calling_agent_test
+          REDIS_URL=redis://localhost:6379/1
+          REQUIRE_TLS_DB=false
+          REQUIRE_TLS_REDIS=false
+          EOF
+          python - <<'PY'
+          import json
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+          priv = key.private_bytes(
+              encoding=serialization.Encoding.PEM,
+              format=serialization.PrivateFormat.PKCS8,
+              encryption_algorithm=serialization.NoEncryption(),
+          ).decode()
+          pub = key.public_key().public_bytes(
+              encoding=serialization.Encoding.PEM,
+              format=serialization.PublicFormat.SubjectPublicKeyInfo,
+          ).decode()
+          import secrets
+          with open(".env.test", "a") as f:
+              f.write(f'JWT_PRIVATE_KEY="{priv}"\n')
+              f.write(f'JWT_PUBLIC_KEY="{pub}"\n')
+              f.write(f'WEBHOOK_HMAC_SECRET={secrets.token_urlsafe(32)}\n')
+          PY
+
+      - name: Run baseline Alembic migration against ephemeral Postgres
+        run: alembic upgrade head
+
+      - name: Create app-role password + grants for CI
+        env:
+          PGPASSWORD: ci_only_pw
+        run: |
+          psql -h localhost -U calling_agent -d calling_agent_test -c "ALTER ROLE calling_agent_app WITH PASSWORD 'app_role_test_pw'; ALTER ROLE calling_agent_app WITH LOGIN;"
+          psql -h localhost -U calling_agent -d calling_agent_test -c "GRANT CONNECT ON DATABASE calling_agent_test TO calling_agent_app; GRANT USAGE ON SCHEMA public TO calling_agent_app;"
+
+      # --- 4. Unit + integration test suite ---
+      - name: Unit tests
+        run: pytest tests/unit -v
+
+      # (No standalone tests/integration/ suite exists yet in Phase 0 — no
+      # component has been built that needs one beyond what layering/
+      # multitenant/contract already cover; this step is a placeholder that
+      # will start asserting real coverage once Phase 1 adds the orchestrator.)
+      - name: Integration tests (placeholder, Phase 1+)
+        run: |
+          if [ -n "$(find tests/integration -name 'test_*.py')" ]; then
+            pytest tests/integration -v
+          else
+            echo "No integration tests yet (Phase 0 has none to run) — not a skip of an existing suite, there is genuinely nothing here yet."
+          fi
+
+      # --- 5. API/contract test suite ---
+      - name: Contract tests
+        run: pytest tests/contract -v
+
+      # --- 6. Multi-tenant isolation suite ---
+      - name: Multi-tenant RLS isolation tests
+        run: pytest tests/multitenant -v
+
+      # --- 7. Regression: eval harness + capacity benchmark ---
+      # No LLM-driven layer exists yet (Phase 3+), so there is no eval
+      # harness to run and no capacity benchmark to diff. This step is
+      # intentionally a no-op with an explicit reason, not a silent skip.
+      - name: Regression suite (eval harness + capacity benchmark)
+        run: echo "No eval harness or capacity benchmark exists yet — Phase 0 has no LLM-driven layer or dispatch path to benchmark."
+
+      # --- 8. Secrets scan + dependency vulnerability scan ---
+      - name: Secrets scan (against reviewed baseline)
+        run: detect-secrets scan --baseline .secrets.baseline --exclude-files '\.venv/.*'
+
+      - name: Dependency vulnerability scan
+        run: pip-audit -r requirements.txt
+
+      # --- 9. Docker image build ---
+      - name: Build Docker image
+        run: docker build -t calling-agent:ci .
