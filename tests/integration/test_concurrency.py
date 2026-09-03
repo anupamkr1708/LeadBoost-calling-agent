@@ -40,8 +40,10 @@ def _dsn() -> str:
 def _count_running() -> int:
     with psycopg.connect(_dsn(), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM call_attempts WHERE status = 'running'")
-        (n,) = cur.fetchone()
-        return n
+        row = cur.fetchone()
+        assert row is not None
+        (n,) = row
+        return int(n)
 
 
 async def _sample_max_running(stop_event: asyncio.Event, interval: float = 0.02) -> int:
@@ -87,7 +89,9 @@ async def test_active_running_never_exceeds_configured_capacity(app_settings):
             while asyncio.get_event_loop().time() < deadline:
                 with psycopg.connect(_dsn(), autocommit=True) as conn, conn.cursor() as cur:
                     cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
-                    (status,) = cur.fetchone()
+                    row = cur.fetchone()
+                    assert row is not None
+                    (status,) = row
                     if status in ("completed", "failed"):
                         return (status,)
                 await asyncio.sleep(0.05)

@@ -65,8 +65,15 @@ CALL_STATES = _Machine(
     terminal_states=frozenset({CallState.COMPLETED, CallState.FAILED, CallState.CANCELLED}),
     legal_transitions={
         # QUEUED = waiting for an attempt to run, including the gap between
-        # a failed-but-retryable attempt and its successor.
-        CallState.QUEUED: frozenset({CallState.IN_PROGRESS, CallState.CANCELLED}),
+        # a failed-but-retryable attempt and its successor. QUEUED -> FAILED
+        # directly (not via IN_PROGRESS) is for the narrow case where an
+        # attempt could be claimed but never legitimately started at all —
+        # found during the Phase 1 hardening pass: a Call whose
+        # organization_id has no corresponding `organizations` row is
+        # discovered at claim time, before any attempt ever reaches
+        # RUNNING, so routing it through IN_PROGRESS first would be
+        # asserting something that never happened.
+        CallState.QUEUED: frozenset({CallState.IN_PROGRESS, CallState.CANCELLED, CallState.FAILED}),
         # IN_PROGRESS = an attempt currently owns this call.
         CallState.IN_PROGRESS: frozenset(
             {CallState.QUEUED, CallState.COMPLETED, CallState.FAILED, CallState.CANCELLED}
@@ -89,6 +96,14 @@ CALL_ATTEMPT_STATES = _Machine(
         {CallAttemptState.COMPLETED, CallAttemptState.FAILED, CallAttemptState.INTERRUPTED}
     ),
     legal_transitions={
+        # PENDING -> INTERRUPTED covers two distinct real cases, both
+        # "this attempt never reached RUNNING and never will": a worker
+        # crashing between claim and the RUNNING transition (the reaper's
+        # original use), and — found during the Phase 1 hardening pass —
+        # discovering the attempt's organization_id has no `organizations`
+        # row at all, which is permanent, not transient, and must not be
+        # conflated with "temporarily at capacity" (see
+        # orchestrator/worker_runtime.py's _try_start_running docstring).
         CallAttemptState.PENDING: frozenset(
             {CallAttemptState.RUNNING, CallAttemptState.INTERRUPTED}
         ),

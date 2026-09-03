@@ -88,7 +88,25 @@ async def test_sweep_expired_leases_returns_and_clears_only_expired(queue):
 
 
 @pytest.mark.asyncio
-async def test_batch_claim_respects_batch_size(queue):
+async def test_sweep_expired_leases_is_exclusive_across_concurrent_reapers(queue):
+    """Regression test for the reaper race identified in the Phase 1
+    hardening pass: 20 concurrent `sweep_expired_leases()` calls (as if 20
+    reaper loops, or several process instances, all polled at the exact
+    same moment) racing over a SINGLE expired lease must yield that
+    attempt_id to EXACTLY ONE caller — the same exclusivity property
+    `test_claim_is_exclusive_across_concurrent_callers` proves for claim(),
+    now proven for sweep too."""
+    await queue.enqueue("attempt-crashed")
+    await queue.claim("worker-doomed", lease_seconds=0.01)
+    await asyncio.sleep(0.05)  # let the lease actually expire
+
+    results = await asyncio.gather(*[queue.sweep_expired_leases() for _ in range(20)])
+    winners = [r for r in results if r]
+    assert len(winners) == 1, f"expected exactly 1 reaper to win the sweep, got {len(winners)}: {results}"
+    assert winners[0] == ["attempt-crashed"]
+
+    total_reclaimed = sum(len(r) for r in results)
+    assert total_reclaimed == 1, f"expected the expired lease reclaimed exactly once total, got {total_reclaimed}"
     for i in range(5):
         await queue.enqueue(f"attempt-batch-{i}")
     claimed = await queue.claim("worker-a", lease_seconds=10, batch_size=3)

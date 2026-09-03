@@ -102,7 +102,7 @@ async def _run_one_load_level(n_calls: int, concurrency: int) -> dict[str, float
     t_end = time.monotonic()
 
     await runtime.stop(grace_period_seconds=5.0)
-    await redis_client.aclose()
+    await redis_client.aclose()  # type: ignore[attr-defined]  # redis-py stubs lag runtime here; aclose() exists
     thread_pool.shutdown(wait=True)
 
     latencies = [completion_times[i] - submit_times[call_ids[i]] for i in range(n_calls)]
@@ -129,8 +129,10 @@ async def _run_one_load_level(n_calls: int, concurrency: int) -> dict[str, float
 def _fetch_status(call_id: uuid.UUID) -> str:
     with psycopg.connect(_dsn(), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
-        (status,) = cur.fetchone()
-        return status
+        row = cur.fetchone()
+        assert row is not None
+        (status,) = row
+        return str(status)
 
 
 async def main() -> None:

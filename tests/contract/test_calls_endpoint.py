@@ -135,7 +135,9 @@ def test_call_actually_completes_through_the_real_running_app(auth_headers, clie
         with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
             cur.execute(f"SET app.current_org_id = '{ORG_ID}'")
             cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
-            (status,) = cur.fetchone()
+            row = cur.fetchone()
+            assert row is not None
+            (status,) = row
         if status in ("completed", "failed"):
             break
         time.sleep(0.05)

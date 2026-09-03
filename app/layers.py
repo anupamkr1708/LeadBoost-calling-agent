@@ -30,6 +30,16 @@ Rules encoded here (expanded as later phases add packages):
    framework-agnostic by construction, so it stays usable from something
    other than this specific FastAPI process (e.g. a standalone worker
    binary) without modification, should a later phase split it out.
+7. (Phase 1 hardening) `storage.db.system_session` — the narrow,
+   cross-organization role used by the worker runtime's reaper/
+   reconciliation sweeps (docs/PHASE1_DESIGN.md "Concurrency / worker
+   acquisition") — may only be imported from `orchestrator/**`. Every
+   other module, especially `api/**` (which is always request-scoped to
+   one authenticated caller's org), must go through `org_scoped_session`
+   like everything else. This is deliberately a symbol-level rule, not
+   just a module-level one: `storage.db` as a whole is fine for anyone to
+   import (`get_session`, `org_scoped_session`), it's specifically this
+   one cross-org-capable function that's restricted.
 """
 from __future__ import annotations
 
@@ -58,9 +68,22 @@ class DependencyBanRule:
 
 
 @dataclass(frozen=True)
+class SymbolConfinementRule:
+    """A specific `from module import symbol` that is confined to one or
+    more allowed importer prefixes — for restricting one function/class
+    within an otherwise-unrestricted module (rule type 7 above)."""
+
+    module: str
+    symbol: str
+    allowed_importer_prefixes: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
 class LayerGraph:
     vendor_confinement: tuple[VendorConfinementRule, ...] = field(default_factory=tuple)
     dependency_bans: tuple[DependencyBanRule, ...] = field(default_factory=tuple)
+    symbol_confinement: tuple[SymbolConfinementRule, ...] = field(default_factory=tuple)
     # Packages that may never be imported by anything except the composition root.
     entrypoint_only_modules: tuple[str, ...] = field(default_factory=tuple)
 
@@ -112,4 +135,19 @@ LAYER_GRAPH = LayerGraph(
         ),
     ),
     entrypoint_only_modules=("app.main",),
+    symbol_confinement=(
+        SymbolConfinementRule(
+            module="storage.db",
+            symbol="system_session",
+            allowed_importer_prefixes=("orchestrator",),
+            reason=(
+                "system_session is the narrow cross-organization role — "
+                "only orchestrator/ (the worker runtime's reaper/"
+                "reconciliation sweeps) has a legitimate reason to look up "
+                "data before knowing which org it belongs to. api/ and "
+                "everything else must always be scoped to the "
+                "authenticated caller's own org via org_scoped_session."
+            ),
+        ),
+    ),
 )

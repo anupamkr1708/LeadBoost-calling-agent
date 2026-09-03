@@ -50,6 +50,20 @@ def _collect_imports(tree: ast.Module) -> list[str]:
     return names
 
 
+def _collect_from_import_symbols(tree: ast.Module) -> list[tuple[str, str]]:
+    """`from module import symbol` pairs specifically — separate from
+    `_collect_imports` because symbol-level rules need to distinguish
+    `from storage.db import system_session` from
+    `from storage.db import get_session`, which module-level import
+    collection can't (and shouldn't have to)."""
+    pairs: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                pairs.append((node.module, alias.name))
+    return pairs
+
+
 def _all_modules_and_imports() -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for path in _iter_first_party_python_files():
@@ -59,6 +73,15 @@ def _all_modules_and_imports() -> dict[str, list[str]]:
         except SyntaxError as e:  # pragma: no cover - a syntax error is its own failure
             pytest.fail(f"Could not parse {path} for layering check: {e}")
         result[module_name] = _collect_imports(tree)
+    return result
+
+
+def _all_modules_and_from_import_symbols() -> dict[str, list[tuple[str, str]]]:
+    result: dict[str, list[tuple[str, str]]] = {}
+    for path in _iter_first_party_python_files():
+        module_name = _module_name_for(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        result[module_name] = _collect_from_import_symbols(tree)
     return result
 
 
@@ -130,6 +153,32 @@ def test_internal_dependency_bans() -> None:
                         violations.append(f"{module_name} imports '{imported}'. {rule.reason}")
 
     assert not violations, "Dependency ban violations found:\n" + "\n".join(violations)
+
+
+def test_symbol_confinement() -> None:
+    """Restricts one specific `from module import symbol` to allowed
+    importer prefixes, for symbols narrower than a whole module (e.g.
+    `storage.db.system_session` — see app.layers's rule 7)."""
+    modules_and_symbols = _all_modules_and_from_import_symbols()
+    violations: list[str] = []
+
+    for module_name, symbols in modules_and_symbols.items():
+        if module_name.startswith("tests."):
+            continue  # tests legitimately exercise restricted internals directly
+        for rule in LAYER_GRAPH.symbol_confinement:
+            is_allowed_importer = any(
+                module_name == prefix or module_name.startswith(prefix + ".")
+                for prefix in rule.allowed_importer_prefixes
+            )
+            if is_allowed_importer:
+                continue
+            if (rule.module, rule.symbol) in symbols:
+                violations.append(
+                    f"{module_name} imports '{rule.symbol}' from '{rule.module}' but only "
+                    f"{rule.allowed_importer_prefixes} may do so. {rule.reason}"
+                )
+
+    assert not violations, "Symbol confinement violations found:\n" + "\n".join(violations)
 
 
 def test_layering_check_actually_scans_a_nonzero_number_of_files() -> None:

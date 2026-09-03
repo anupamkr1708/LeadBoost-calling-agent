@@ -60,6 +60,77 @@ def test_different_idempotency_keys_create_different_calls():
 
 
 @pytest.mark.asyncio
+async def test_retry_with_same_idempotency_key_after_call_already_completed_returns_completed_call(app_settings):
+    """Phase 1 hardening item F's explicit second half: idempotency isn't
+    just about the admission race — a caller retrying (e.g. after a
+    network timeout on their end, even though the original request
+    actually succeeded) with the same key AFTER the call has already run
+    to completion must get back the SAME, now-completed Call — not a new
+    one, and not one that gets re-executed."""
+    from tests.integration.runtime_test_helpers import build_test_runtime
+
+    runtime, queue, redis_client = build_test_runtime(redis_url=app_settings.redis_url.get_secret_value())
+    await runtime.start()
+    try:
+        service = CallService()
+        key = str(uuid.uuid4())
+        first = await asyncio.to_thread(
+            service.create_call,
+            organization_id=ORG_ID,
+            lead_id=1,
+            agent_config_id=None,
+            campaign_id=None,
+            idempotency_key=key,
+        )
+        assert first.is_new
+        await queue.enqueue(str(first.first_attempt_id))
+
+        import psycopg
+
+        from app.config import get_settings
+
+        settings = get_settings()
+        migration_url = settings.database_migration_url or settings.database_url
+        dsn = migration_url.get_secret_value().replace("postgresql+psycopg://", "postgresql://")
+
+        deadline = asyncio.get_event_loop().time() + 5.0
+        status = None
+        while asyncio.get_event_loop().time() < deadline:
+            with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+                cur.execute("SELECT status FROM calls WHERE id = %s", (first.call_id,))
+                (status,) = cur.fetchone()
+            if status == "completed":
+                break
+            await asyncio.sleep(0.02)
+        assert status == "completed"
+
+        # The "retry" — same org, same idempotency key, sent again well
+        # after the original actually finished.
+        retry = await asyncio.to_thread(
+            service.create_call,
+            organization_id=ORG_ID,
+            lead_id=1,
+            agent_config_id=None,
+            campaign_id=None,
+            idempotency_key=key,
+        )
+        assert retry.call_id == first.call_id
+        assert retry.is_new is False
+        assert retry.status == "completed"
+        assert retry.first_attempt_id is None  # must not signal "enqueue a new attempt"
+
+        # And durably: still exactly one CallAttempt row — the retry must
+        # not have caused a second execution.
+        with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM call_attempts WHERE call_id = %s", (first.call_id,))
+            (attempt_count,) = cur.fetchone()
+            assert attempt_count == 1
+    finally:
+        await runtime.stop(grace_period_seconds=2.0)
+        await redis_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_ten_concurrent_identical_requests_create_exactly_one_call():
     """THE authoritative idempotency test: real concurrent Postgres
     transactions racing on the same idempotency key, not a sequential

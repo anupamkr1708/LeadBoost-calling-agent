@@ -39,9 +39,11 @@ async def _wait_until_terminal(call_id: uuid.UUID, timeout: float = 5.0) -> str:
     while asyncio.get_event_loop().time() < deadline:
         with psycopg.connect(_dsn(), autocommit=True) as conn, conn.cursor() as cur:
             cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
-            (status,) = cur.fetchone()
+            row = cur.fetchone()
+            assert row is not None, f"no calls row for {call_id}"
+            (status,) = row
             if status in ("completed", "failed", "cancelled"):
-                return status
+                return str(status)
         await asyncio.sleep(0.02)
     raise AssertionError(f"call {call_id} never reached a terminal state")
 

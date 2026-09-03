@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 
+import structlog
 from fastapi import APIRouter, Depends, Request, status
 
 from api.auth import AuthContext, require_auth
@@ -21,6 +22,7 @@ from orchestrator.call_service import CallService
 
 router = APIRouter(prefix="/v1", tags=["calls"])
 _call_service = CallService()
+logger = structlog.get_logger(__name__)
 
 
 @router.post("/calls", response_model=CreateCallResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -37,6 +39,24 @@ async def create_call(
         agent_config_id=body.agent_config_id,
         campaign_id=body.campaign_id,
         idempotency_key=body.idempotency_key,
+    )
+
+    # Phase 1 hardening item J ("observability"): this is the ONE place an
+    # HTTP request_id (api/errors.py's middleware) and a call_id are both
+    # available together — execution happens asynchronously, potentially
+    # much later and in a different worker process, so there's no ongoing
+    # request context to attach a trace to by then. Logging the pairing
+    # here, once, is what makes "which HTTP request created this call"
+    # answerable later by cross-referencing call_id, without building a
+    # distributed tracing system Phase 1 doesn't need.
+    request_id = getattr(request.state, "request_id", None)
+    logger.info(
+        "call_admitted",
+        request_id=request_id,
+        call_id=str(created.call_id),
+        organization_id=auth.organization_id,
+        is_new=created.is_new,
+        first_attempt_id=str(created.first_attempt_id) if created.first_attempt_id else None,
     )
 
     if created.is_new:

@@ -20,7 +20,7 @@ from redis.asyncio import Redis
 
 from api.endpoints import calls, health
 from api.errors import register_exception_handlers
-from app.config import get_settings
+from app.config import ConfigError, get_settings
 from orchestrator.failures import RetryPolicy
 from orchestrator.queue import Queue
 from orchestrator.worker_runtime import WorkerRuntime
@@ -29,6 +29,31 @@ from telephony.fake import FakeTelephonyProvider
 
 # Fail closed BEFORE constructing the FastAPI app at all.
 _settings = get_settings()
+
+# Phase 1 hardening item I ("configuration parity" / "no production
+# runtime dependency should silently use a fake provider"): app/config.py
+# already refuses to boot in production with placeholder vendor API keys
+# (exotel_api_key etc.) — but that check is necessary, not sufficient. It
+# protects against "you forgot to set a real credential"; it does NOT
+# protect against the actual Phase 1 gap, which is that this composition
+# root unconditionally constructs FakeTelephonyProvider() below regardless
+# of what those credentials are, because no real adapter exists yet. A
+# deployer could set fully real, non-placeholder Exotel/Deepgram
+# credentials in production and this service would STILL silently place
+# zero real calls. Since there is genuinely no real provider to fall back
+# to in Phase 1, the only honest fail-closed answer is to refuse to boot
+# in production at all — not to pretend a credential check that doesn't
+# gate the real risk is protection. This is a deliberate, temporary gate:
+# remove it in the same change that wires in a real TelephonyProvider.
+if _settings.environment == "production":
+    raise ConfigError(
+        "Refusing to start in production: Phase 1 has no real telephony "
+        "provider implemented (telephony/fake.py is the only adapter that "
+        "exists). Starting in production today would silently simulate "
+        "every call instead of placing it. This check is intentional and "
+        "temporary — remove it in the same change that wires in a real "
+        "TelephonyProvider in this composition root."
+    )
 
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO
@@ -81,6 +106,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         queue_lease_seconds=_settings.queue_lease_seconds,
         queue_poll_interval_seconds=_settings.queue_poll_interval_seconds,
         provider_operation_timeout_seconds=_settings.provider_operation_timeout_seconds,
+        queue_claim_batch_size=_settings.queue_claim_batch_size,
     )
 
     app.state.queue = queue

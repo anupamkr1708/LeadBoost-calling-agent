@@ -57,6 +57,39 @@ end
 return claimed
 """
 
+# Mirrors _CLAIM_SCRIPT_SOURCE's exact pattern for the same reason: reading
+# expired members with ZRANGEBYSCORE and THEN removing them in a separate
+# round trip (the original implementation) is a check-then-act race — two
+# concurrent reapers (two processes, per docs/PHASE1_DESIGN.md's
+# multi-process readiness) can both read the same expired member before
+# either has removed it, and both then proceed to "recover" it
+# independently. Postgres's ux_attempts_one_running_per_call and the
+# WHERE-status guards in orchestrator/worker_runtime.py's recovery path
+# make the WORST case of that race non-catastrophic (no duplicate
+# concurrent execution), but it can still produce duplicate CallAttempt
+# rows and wasted work — a real queue-semantics defect, not just a
+# theoretical one. Folding the read and the removal into one atomic script
+# (same technique as claim, above) closes it at the source: exactly one
+# caller, across any number of concurrent reapers, ever gets a given
+# expired member back from this script.
+_SWEEP_EXPIRED_SCRIPT_SOURCE = """
+local inflight_key = KEYS[1]
+local owner_key = KEYS[2]
+local cutoff = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+
+local candidates = redis.call('ZRANGEBYSCORE', inflight_key, '-inf', cutoff, 'LIMIT', 0, limit)
+local reclaimed = {}
+for _, member in ipairs(candidates) do
+    local removed = redis.call('ZREM', inflight_key, member)
+    if removed == 1 then
+        redis.call('HDEL', owner_key, member)
+        table.insert(reclaimed, member)
+    end
+end
+return reclaimed
+"""
+
 
 @dataclass(frozen=True)
 class QueueKeys:
@@ -73,6 +106,7 @@ class Queue:
         # fallback to EVAL (and re-registering) if the script has been
         # flushed from Redis's script cache — no manual SHA bookkeeping.
         self._claim_script: AsyncScript = redis_client.register_script(_CLAIM_SCRIPT_SOURCE)
+        self._sweep_script: AsyncScript = redis_client.register_script(_SWEEP_EXPIRED_SCRIPT_SOURCE)
 
     async def enqueue(self, attempt_id: str, ready_at: float | None = None) -> None:
         score = ready_at if ready_at is not None else time.time()
@@ -99,20 +133,21 @@ class Queue:
         await self.ack(attempt_id)
         await self.enqueue(next_attempt_id, ready_at)
 
-    async def sweep_expired_leases(self, now: float | None = None) -> list[str]:
-        """Called by the reaper. Returns the attempt ids whose lease
-        expired, having already removed them from inflight/owner — the
-        caller decides what happened to each (docs/PHASE1_DESIGN.md
-        "Queue (Redis)" / "Worker-crash recovery") by checking Postgres,
-        which is the durable truth this Redis bookkeeping is only ever a
-        coordination layer over."""
+    async def sweep_expired_leases(self, now: float | None = None, limit: int = 1000) -> list[str]:
+        """Called by the reaper. Atomically identifies AND removes expired
+        inflight members in one Redis-side script (see
+        `_SWEEP_EXPIRED_SCRIPT_SOURCE`'s comment for why this replaced an
+        earlier read-then-remove version) — the caller decides what
+        happened to each returned attempt (docs/PHASE1_DESIGN.md "Queue
+        (Redis)" / "Worker-crash recovery") by checking Postgres, which is
+        the durable truth this Redis bookkeeping is only ever a
+        coordination layer over. Because the removal is part of the same
+        atomic operation as the read, a given expired attempt_id is
+        returned to AT MOST ONE caller, even under concurrent reapers
+        (verified by tests/integration/test_reaper_race.py)."""
         cutoff = now if now is not None else time.time()
-        expired_raw = await self._redis.zrangebyscore(self._keys.inflight, "-inf", cutoff)
-        expired = [m.decode() if isinstance(m, bytes) else m for m in expired_raw]
-        if expired:
-            await self._redis.zrem(self._keys.inflight, *expired)
-            await self._redis.hdel(self._keys.owner, *expired)
-        return expired
+        result = await self._sweep_script(keys=[self._keys.inflight, self._keys.owner], args=[cutoff, limit])
+        return [member.decode() if isinstance(member, bytes) else member for member in result]
 
     async def is_queued(self, attempt_id: str) -> bool:
         """True if the attempt is currently in `ready` or `inflight` —

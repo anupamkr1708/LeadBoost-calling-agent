@@ -29,6 +29,7 @@ def build_test_runtime(
     provider_operation_timeout_seconds: float = 2.0,
     retry_max_attempts: int = 3,
     retry_initial_delay_seconds: float = 0.1,
+    queue_claim_batch_size: int = 1,
 ) -> tuple[WorkerRuntime, Queue, Redis]:
     """Fast, test-tuned timings (sub-second polling/leases) so integration
     tests don't need to sleep for the production defaults (0.5s poll,
@@ -53,5 +54,6 @@ def build_test_runtime(
         queue_lease_seconds=queue_lease_seconds,
         queue_poll_interval_seconds=queue_poll_interval_seconds,
         provider_operation_timeout_seconds=provider_operation_timeout_seconds,
+        queue_claim_batch_size=queue_claim_batch_size,
     )
     return runtime, queue, redis_client

@@ -153,10 +153,11 @@ class CallAttempt(Base):
         Index("ix_attempts_lead_scheduled", "lead_id", "scheduled_at"),
         Index("ix_attempts_org_id", "organization_id"),
         Index("ix_attempts_call_id", "call_id"),
-        # Partial index WHERE status = 'pending' (TRD Part 4.2), and the
+        # Partial index WHERE status = 'pending' (TRD Part 4.2), the
         # Phase 1 "at most one RUNNING attempt per call" partial unique
-        # index, are both created as raw SQL in the alembic migration —
-        # see decision #4.
+        # index, and the Phase 1 hardening pass's
+        # ux_attempts_call_id_attempt_number uniqueness constraint are all
+        # created as raw SQL in the alembic migrations — see decision #4.
     )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
