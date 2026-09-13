@@ -10,6 +10,7 @@ important testing principle": don't fake the component under test.
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 from redis.asyncio import Redis
 
@@ -17,6 +18,9 @@ from orchestrator.failures import RetryPolicy
 from orchestrator.queue import Queue
 from orchestrator.worker_runtime import WorkerRuntime
 from telephony.fake import FakeTelephonyProvider, ScenarioSource
+
+if TYPE_CHECKING:
+    from orchestrator.worker_runtime import ConversationEngineFactory
 
 
 def build_test_runtime(
@@ -30,11 +34,15 @@ def build_test_runtime(
     retry_max_attempts: int = 3,
     retry_initial_delay_seconds: float = 0.1,
     queue_claim_batch_size: int = 1,
+    conversation_engine_factory: ConversationEngineFactory | None = None,
 ) -> tuple[WorkerRuntime, Queue, Redis]:
     """Fast, test-tuned timings (sub-second polling/leases) so integration
     tests don't need to sleep for the production defaults (0.5s poll,
     45s lease) — the mechanism under test is identical, only the clock is
-    compressed."""
+    compressed. `conversation_engine_factory` (Phase 2) is passed straight
+    through to `WorkerRuntime`, defaulting to `None` (plain Phase 1
+    behavior) — see `orchestrator.worker_runtime.ConversationEngineFactory`.
+    """
     redis_client: Redis = Redis.from_url(redis_url)
     queue = Queue(redis_client)
     provider = FakeTelephonyProvider(scenario_source=scenario_source) if scenario_source else FakeTelephonyProvider()
@@ -55,5 +63,6 @@ def build_test_runtime(
         queue_poll_interval_seconds=queue_poll_interval_seconds,
         provider_operation_timeout_seconds=provider_operation_timeout_seconds,
         queue_claim_batch_size=queue_claim_batch_size,
+        conversation_engine_factory=conversation_engine_factory,
     )
     return runtime, queue, redis_client

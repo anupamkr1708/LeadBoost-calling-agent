@@ -40,6 +40,18 @@ Rules encoded here (expanded as later phases add packages):
    just a module-level one: `storage.db` as a whole is fine for anyone to
    import (`get_session`, `org_scoped_session`), it's specifically this
    one cross-org-capable function that's restricted.
+8. (Phase 2) `intelligence/**` and `guardrails/**` — the semantic
+   reasoning and authorization layers — never import `storage` (no DB
+   access at all: "interpreter does not mutate database", master prompt
+   §40), never import `orchestrator/**` (the same "never reach toward
+   infrastructure" direction Phase 1 established for `conversation/`,
+   extended one layer further out since `intelligence/` sits BELOW
+   `conversation/` in the dependency chain: orchestrator -> conversation
+   -> {intelligence, guardrails, telephony}), never import `telephony/**`
+   (the intelligence layer reasons about conversation content, not call
+   lifecycle — that boundary belongs to `conversation/semantic_loop.py`,
+   which sits between them), and never import `fastapi` (framework-
+   agnostic, same reasoning as rule 6).
 """
 from __future__ import annotations
 
@@ -132,6 +144,45 @@ LAYER_GRAPH = LayerGraph(
                 "execution runtime, not the web layer, and should remain "
                 "usable without FastAPI in the loop."
             ),
+        ),
+        DependencyBanRule(
+            banned_import_prefixes=("storage",),
+            forbidden_importer_prefixes=("intelligence", "guardrails"),
+            reason=(
+                "intelligence/ and guardrails/ must never touch the "
+                "database — master prompt §40: 'interpreter does not "
+                "mutate database'. Persistence of semantic turns lives in "
+                "conversation/persistence.py, one layer up, which is "
+                "explicitly allowed to import storage."
+            ),
+        ),
+        DependencyBanRule(
+            banned_import_prefixes=("orchestrator",),
+            forbidden_importer_prefixes=("intelligence", "guardrails"),
+            reason=(
+                "intelligence/ and guardrails/ sit BELOW conversation/ in "
+                "the dependency chain (orchestrator -> conversation -> "
+                "{intelligence, guardrails, telephony}) — master prompt "
+                "§40: 'planner does not execute infrastructure'."
+            ),
+        ),
+        DependencyBanRule(
+            banned_import_prefixes=("telephony",),
+            forbidden_importer_prefixes=("intelligence", "guardrails"),
+            reason=(
+                "intelligence/ and guardrails/ reason about conversation "
+                "content, never call lifecycle — that boundary belongs to "
+                "conversation/semantic_loop.py, which sits between them. "
+                "master prompt §40: 'intelligence does not import "
+                "telephony SDKs', generalized to the whole package: "
+                "intelligence has no legitimate reason to know telephony "
+                "exists at all, not just its vendor SDKs."
+            ),
+        ),
+        DependencyBanRule(
+            banned_import_prefixes=("fastapi",),
+            forbidden_importer_prefixes=("intelligence", "guardrails"),
+            reason="intelligence/ and guardrails/ stay framework-agnostic, same reasoning as rule 6 for orchestrator/.",
         ),
     ),
     entrypoint_only_modules=("app.main",),

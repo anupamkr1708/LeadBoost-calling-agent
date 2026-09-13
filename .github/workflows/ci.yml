@@ -48,7 +48,7 @@ jobs:
 
       # --- 2. Type check (strict mode) ---
       - name: Type check (mypy --strict on core packages)
-        run: mypy --strict app api storage orchestrator telephony conversation
+        run: mypy --strict app api storage orchestrator telephony conversation intelligence guardrails
 
       - name: Type check (mypy, whole repo incl. tests)
         run: mypy . --exclude 'alembic/versions' --exclude '.venv'

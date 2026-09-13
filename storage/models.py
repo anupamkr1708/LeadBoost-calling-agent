@@ -226,6 +226,56 @@ class CallAttemptEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ConversationTurn(Base):
+    """Phase 2: the durable, richly-observable record of ONE semantic
+    turn (docs/PHASE2_DESIGN.md "Observability" / master prompt §28) —
+    distinct from `CallAttemptEvent` (Phase 1's lifecycle event log),
+    which has no concept of state-before/state-after or model metadata
+    and shouldn't be overloaded to carry them. State snapshots,
+    interpretation, plan, guardrail result, and final action are all
+    stored as JSON text, matching this codebase's established convention
+    (see `CallAttemptEvent.detail`, `AgentConfig`-adjacent columns) rather
+    than native JSONB — consistent with "reuse existing patterns," not a
+    new convention introduced for Phase 2. `turn_number` (not
+    `created_at`) is the real ordering key, same reasoning as
+    `CallAttemptEvent.sequence_number`."""
+
+    __tablename__ = "conversation_turns"
+    __table_args__ = (
+        UniqueConstraint("session_id", "turn_number", name="uq_conversation_turn_number"),
+        Index("ix_conversation_turns_org_id", "organization_id"),
+        Index("ix_conversation_turns_session_id", "session_id"),
+        Index("ix_conversation_turns_attempt_id", "call_attempt_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    call_attempt_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)  # soft ref
+    session_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)  # soft ref
+    turn_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    speaker: Mapped[str] = mapped_column(String, nullable=False)
+    transcript: Mapped[str] = mapped_column(Text, nullable=False)
+    state_before: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    state_after: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    interpretation: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    plan: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    guardrail_result: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    final_action: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    interpretation_model: Mapped[str] = mapped_column(String, nullable=False)
+    interpretation_provider: Mapped[str] = mapped_column(String, nullable=False)
+    interpretation_prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    interpretation_policy_version: Mapped[str] = mapped_column(String, nullable=False)
+    interpretation_context_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    interpretation_latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    planner_model: Mapped[str] = mapped_column(String, nullable=False)
+    planner_prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    planner_latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    response_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    response_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class CallIdempotencyKey(Base):
     """The REAL enforcement point for `POST /v1/calls` idempotency — see
     docs/PHASE1_DESIGN.md "Idempotency" for why this can't just be a unique

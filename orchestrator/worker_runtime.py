@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,7 +36,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from conversation.runtime import ExecutionResult, execute_call_attempt
+from conversation.runtime import ConversationEngineConfig, ExecutionResult, execute_call_attempt
 from orchestrator.failures import RetryPolicy
 from orchestrator.queue import Queue
 from orchestrator.states import (
@@ -82,6 +83,17 @@ class _ReaperOutcome:
     delay_seconds: float = 0.0
 
 
+# Phase 2's one new extension point: given the attempt being claimed, its
+# real attempt_id, and the session id `_try_start_running` already
+# created, optionally return a `ConversationEngineConfig` to run a
+# semantic conversation once the call connects — or `None` for plain
+# Phase 1 behavior. Returning `None` for some attempts and a config for
+# others (e.g. only orgs with an LLM-enabled agent config) is a
+# legitimate, expected use — this is a per-attempt decision, not a global
+# on/off switch.
+ConversationEngineFactory = Callable[[_AttemptContext, uuid.UUID, uuid.UUID], ConversationEngineConfig | None]
+
+
 class WorkerRuntime:
     def __init__(
         self,
@@ -95,6 +107,7 @@ class WorkerRuntime:
         queue_poll_interval_seconds: float,
         provider_operation_timeout_seconds: float,
         queue_claim_batch_size: int = 1,
+        conversation_engine_factory: ConversationEngineFactory | None = None,
     ) -> None:
         self._instance_id = instance_id
         self._queue = queue
@@ -105,6 +118,13 @@ class WorkerRuntime:
         self._queue_poll_interval_seconds = queue_poll_interval_seconds
         self._provider_operation_timeout_seconds = provider_operation_timeout_seconds
         self._queue_claim_batch_size = queue_claim_batch_size
+        # Phase 2's ENTIRE integration footprint in this class: one
+        # optional, injected factory, defaulting to None everywhere
+        # (docs/PHASE2_DESIGN.md "Production execution integration" —
+        # "Do NOT rewrite WorkerRuntime"). When None, the single call site
+        # below is byte-identical to Phase 1. Nothing about claim,
+        # capacity, retry, state transitions, or shutdown changed.
+        self._conversation_engine_factory = conversation_engine_factory
         self._stopping = False
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -260,7 +280,14 @@ class WorkerRuntime:
         )
 
         context = CallAttemptContext(call_attempt_id=attempt_id, attempt_number=loaded.attempt_number)
-        result = await execute_call_attempt(context, self._provider, self._provider_operation_timeout_seconds)
+        conversation_engine = (
+            self._conversation_engine_factory(loaded, attempt_id, session_id)
+            if self._conversation_engine_factory
+            else None
+        )
+        result = await execute_call_attempt(
+            context, self._provider, self._provider_operation_timeout_seconds, conversation_engine
+        )
         outcome = await asyncio.to_thread(self._finalize_attempt, loaded, attempt_id, session_id, result)
         logger.info(
             "attempt_finalized",
